@@ -44,15 +44,18 @@ app.post(
     try {
       const session = event.data.object;
       const email = session.customer_details && session.customer_details.email;
+      const businessName =
+        (session.customer_details && session.customer_details.business_name) ||
+        "the customer's business";
       const fields = session.custom_fields || [];
 
-      // Fields are read in the order you configured them in the Stripe
-      // Payment Link: 0 = business name, 1-3 = competitors.
+      // All 3 custom fields are competitors now (business name comes from
+      // Stripe's built-in "Collect business names" field instead, since
+      // Payment Links only support 3 custom fields).
       const getField = (i) =>
         fields[i] && fields[i].text ? fields[i].text.value : "";
 
-      const businessName = getField(0) || "the customer's business";
-      const competitors = [getField(1), getField(2), getField(3)].filter(
+      const competitors = [getField(0), getField(1), getField(2)].filter(
         Boolean
       );
 
