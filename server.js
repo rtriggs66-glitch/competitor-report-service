@@ -1,7 +1,6 @@
 const express = require("express");
 const Stripe = require("stripe");
 const PDFDocument = require("pdfkit");
-const nodemailer = require("nodemailer");
 
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -174,21 +173,36 @@ function buildPdf(businessName, reportText) {
 }
 
 async function sendEmail(toEmail, businessName, pdfBuffer) {
-  const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-      user: process.env.GMAIL_USER,
-      pass: process.env.GMAIL_APP_PASSWORD,
+  const resp = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "api-key": process.env.BREVO_API_KEY,
+      "Content-Type": "application/json",
+      Accept: "application/json",
     },
+    body: JSON.stringify({
+      sender: {
+        email: process.env.GMAIL_USER,
+        name: "Review Your Competition",
+      },
+      to: [{ email: toEmail }],
+      subject: `Your competitor report for ${businessName}`,
+      textContent:
+        "Thanks for your order! Your competitor report is attached as a PDF.",
+      attachment: [
+        {
+          content: pdfBuffer.toString("base64"),
+          name: "Competitor-Report.pdf",
+        },
+      ],
+    }),
   });
 
-  await transporter.sendMail({
-    from: `"Review Your Competition" <${process.env.GMAIL_USER}>`,
-    to: toEmail,
-    subject: `Your competitor report for ${businessName}`,
-    text: "Thanks for your order! Your competitor report is attached as a PDF.",
-    attachments: [{ filename: "Competitor-Report.pdf", content: pdfBuffer }],
-  });
+  if (!resp.ok) {
+    const errText = await resp.text();
+    console.error("Brevo send failed:", resp.status, errText);
+    throw new Error("Email send failed via Brevo.");
+  }
 }
 
 const PORT = process.env.PORT || 3000;
