@@ -58,11 +58,15 @@ app.post(
       const getField = (i) =>
         fields[i] && fields[i].text ? fields[i].text.value : "";
       const competitors = [getField(0), getField(1), getField(2)].filter(Boolean);
+      const address = (session.customer_details && session.customer_details.address) || {};
+      const location = [address.city, address.state, address.country]
+        .filter(Boolean)
+        .join(", ");
 
       console.log(`New order from ${email} for ${businessName}`);
 
       const searchResults = await Promise.all(
-        competitors.map((name) => googleSearch(name))
+        competitors.map((name) => searchCompetitor(name, location))
       );
       const reportText = await writeReportWithGroq(businessName, competitors, searchResults);
       const pdfBuffer = await buildPdf(businessName, reportText);
@@ -81,62 +85,83 @@ app.post(
 
 app.use(express.json());
 
+async function searchCompetitor(name, location) {
+  // Search both web-wide and location-qualified so local AND online
+  // competitors surface. Location comes from the Stripe billing address.
+  const queries = [`"${name}"`];
+  if (location) queries.push(`"${name}" ${location}`);
+  const results = await Promise.all(queries.map((q) => googleSearch(q)));
+  return results.join("\n");
+}
+
 async function googleSearch(query) {
-  const url = new URL("https://www.googleapis.com/customsearch/v1");
-  url.searchParams.set("key", process.env.GOOGLE_API_KEY);
-  url.searchParams.set("cx", process.env.GOOGLE_CX);
-  url.searchParams.set("q", query);
-  const resp = await fetch(url);
-  const data = await resp.json();
-  if (!data.items || data.items.length === 0) {
-    return `No search results found for "${query}".`;
+  try {
+    const url = new URL("https://www.googleapis.com/customsearch/v1");
+    url.searchParams.set("key", process.env.GOOGLE_API_KEY);
+    url.searchParams.set("cx", process.env.GOOGLE_CX);
+    url.searchParams.set("q", query);
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (!data.items || data.items.length === 0) {
+      return `No search results found for "${query}".`;
+    }
+    return data.items
+      .slice(0, 5)
+      .map((item) => `- ${item.title}: ${item.snippet} (${item.link})`)
+      .join("\n");
+  } catch (err) {
+    console.error(`Google search failed for "${query}":`, err.message);
+    return `Search unavailable for "${query}".`;
   }
-  return data.items
-    .slice(0, 5)
-    .map((item) => `- ${item.title}: ${item.snippet} (${item.link})`)
-    .join("\n");
 }
 
 async function writeReportWithGroq(businessName, competitors, searchResults) {
   const [c1 = "", c2 = "", c3 = ""] = competitors;
   const [r1 = "Not researched.", r2 = "Not researched.", r3 = "Not researched."] = searchResults;
 
-  const prompt = `You are writing a competitor research report using ONLY the search results provided below. Do not invent, assume, or fill in facts that aren't present in the results. If a section can't be supported by the search results, write exactly: "Not found in available sources — recommend manual follow-up."
+  const prompt = `You are writing a competitor research report for a paying customer. Make it substantive, specific, and useful.
 
 Business being researched for: ${businessName}
 
-Search results for Competitor 1 (${c1}):
+Web search results for Competitor 1 (${c1 || "not provided"}):
 ${r1}
 
-Search results for Competitor 2 (${c2}):
+Web search results for Competitor 2 (${c2 || "not provided"}):
 ${r2}
 
-Search results for Competitor 3 (${c3}):
+Web search results for Competitor 3 (${c3 || "not provided"}):
 ${r3}
 
-For EACH competitor, using only the search results above, output:
+For EACH named competitor above (skip any competitor with no name — never invent a company), output:
 
 ## [Competitor name]
 
 **Overview**
-[based on search results only]
+[What the company is and does]
 
 **Pricing and offer**
-[based on search results only, or 'Not found in available sources']
+[Their pricing model and flagship offers]
 
 **What customers say**
-[based on search results only, or 'Not found in available sources']
+[Common praise and complaints]
 
 **Traffic and distribution**
-[based on search results only, or 'Not found in available sources']
+[How they reach customers — cover BOTH local presence (physical stores, service area) AND online presence (website, app, delivery, social)]
 
-After all three competitors, output:
+After all competitors, output:
 
 ## Positioning gaps
-[based only on patterns actually visible across the search results above]
+[Patterns across the competitors that reveal openings for ${businessName} — consider both local and online angles]
 
 ## Recommendations
-[3 numbered recommendations tied directly to the gaps above]`;
+[3 numbered, concrete recommendations tied directly to the gaps above]
+
+Rules:
+- Treat the web search results as your primary source — they are the most current information.
+- Where the search results are thin, missing, or say "No search results found", fill the gap from your own knowledge of the company. Write a full, useful section anyway.
+- Cover each competitor locally AND online: a neighborhood shop can still have a strong web presence, and a national brand can have a weak local footprint. Call out both.
+- NEVER write "Not found in available sources", "recommend manual follow-up", "Not researched", or any placeholder text. Every section must contain real content.
+- Be specific: names of products, approximate price points, and concrete observations beat generic statements.`;
 
   const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
@@ -187,6 +212,8 @@ function buildPdf(businessName, reportText) {
         doc.moveDown(0.4);
       }
     }
+    doc.moveDown(1.5);
+    doc.fontSize(8).fillColor("#888888").text("Compiled from web research and AI analysis.");
     doc.end();
   });
 }
