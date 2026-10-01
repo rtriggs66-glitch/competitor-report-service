@@ -5,6 +5,25 @@ const PDFDocument = require("pdfkit");
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// Startup check: log any missing env vars so failures are obvious in Render logs
+const requiredEnv = [
+  "STRIPE_SECRET_KEY",
+  "STRIPE_WEBHOOK_SECRET",
+  "GOOGLE_API_KEY",
+  "GOOGLE_CX",
+  "GROQ_API_KEY",
+  "BREVO_API_KEY",
+];
+const missingEnv = requiredEnv.filter((k) => !process.env[k]);
+if (missingEnv.length > 0) {
+  console.error("Missing env vars:", missingEnv.join(", "));
+}
+if (!process.env.BREVO_SENDER_EMAIL && !process.env.GMAIL_USER) {
+  console.error(
+    "Missing email sender: set BREVO_SENDER_EMAIL or GMAIL_USER to your Brevo-verified sender address."
+  );
+}
+
 app.get("/", (req, res) => {
   res.send("Competitor report service is running.");
 });
@@ -173,6 +192,13 @@ function buildPdf(businessName, reportText) {
 }
 
 async function sendEmail(toEmail, businessName, pdfBuffer) {
+  const senderEmail = process.env.BREVO_SENDER_EMAIL || process.env.GMAIL_USER;
+  if (!senderEmail) {
+    throw new Error(
+      "Email sender not configured: set BREVO_SENDER_EMAIL or GMAIL_USER env var to your Brevo-verified sender address."
+    );
+  }
+
   const resp = await fetch("https://api.brevo.com/v3/smtp/email", {
     method: "POST",
     headers: {
@@ -182,7 +208,7 @@ async function sendEmail(toEmail, businessName, pdfBuffer) {
     },
     body: JSON.stringify({
       sender: {
-        email: process.env.GMAIL_USER,
+        email: senderEmail,
         name: "Review Your Competition",
       },
       to: [{ email: toEmail }],
