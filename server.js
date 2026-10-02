@@ -119,7 +119,7 @@ async function writeReportWithGroq(businessName, competitors, searchResults) {
   const [c1 = "", c2 = "", c3 = ""] = competitors;
   const [r1 = "Not researched.", r2 = "Not researched.", r3 = "Not researched."] = searchResults;
 
-  const prompt = `You are writing a competitor research report for a paying customer. Make it substantive, specific, and useful.
+  const prompt = `You are writing a competitor research report for a paying customer. The first half profiles each competitor. The second half is analysis — that analysis is what the customer is paying for, so make it sharp, specific, and impossible to mistake for a Google search summary.
 
 Business being researched for: ${businessName}
 
@@ -148,20 +148,39 @@ For EACH named competitor above (skip any competitor with no name — never inve
 **Traffic and distribution**
 [How they reach customers — cover BOTH local presence (physical stores, service area) AND online presence (website, app, delivery, social)]
 
-After all competitors, output:
+After all competitors, output the analysis:
+
+## Head-to-head comparison
+
+For each dimension below, give one short, direct line per competitor in this exact format:
+
+**Price point**
+- [Competitor name]: [where they sit on price, with specifics]
+
+**Signature offer**
+- [Competitor name]: [what they lead with]
+
+**Biggest strength**
+- [Competitor name]: [the one thing they do best]
+
+**Biggest weakness**
+- [Competitor name]: [their most exploitable gap]
 
 ## Positioning gaps
-[Patterns across the competitors that reveal openings for ${businessName} — consider both local and online angles]
 
-## Recommendations
-[3 numbered, concrete recommendations tied directly to the gaps above]
+[The gaps NONE of the competitors are covering — unmet customer needs, ignored audiences, weak local or online presence. Explain why each gap is an opening for ${businessName}.]
+
+## Your 30-day action plan
+
+[A numbered list of concrete moves ${businessName} can execute in the next 30 days — one action per line, each tied to a gap above. Quick wins first, bigger plays after. Each item: the action, then one line on why it works.]
 
 Rules:
 - Treat the web search results as your primary source — they are the most current information.
 - Where the search results are thin, missing, or say "No search results found", fill the gap from your own knowledge of the company. Write a full, useful section anyway.
 - Cover each competitor locally AND online: a neighborhood shop can still have a strong web presence, and a national brand can have a weak local footprint. Call out both.
 - NEVER write "Not found in available sources", "recommend manual follow-up", "Not researched", or any placeholder text. Every section must contain real content.
-- Be specific: names of products, approximate price points, and concrete observations beat generic statements.`;
+- Be specific: names of products, approximate price points, and concrete observations beat generic statements.
+- Every recommendation must trace back to a gap named in this report — no generic marketing advice.`;
 
   const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
