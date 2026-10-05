@@ -51,24 +51,61 @@ app.post(
     try {
       const session = event.data.object;
       const email = session.customer_details && session.customer_details.email;
-      const businessName =
-        (session.customer_details && session.customer_details.business_name) ||
-        "the customer's business";
       const fields = session.custom_fields || [];
       const getField = (i) =>
         fields[i] && fields[i].text ? fields[i].text.value : "";
-      const competitors = [getField(0), getField(1), getField(2)].filter(Boolean);
+      // Intake: the customer describes THEIR business. Naming competitors
+      // is optional (field 3) — discovery finds the rest, including the
+      // ones they don't know exist.
+      // Payment link field order: 1 business name, 2 what it does,
+      // 3 competitors you already know (optional).
+      const businessName =
+        getField(0) ||
+        (session.customer_details && session.customer_details.business_name) ||
+        "the customer's business";
+      const businessType = getField(1);
+      // Optional: competitors the customer already knows (field 3,
+      // comma-separated). Discovery still runs and fills remaining slots.
+      const knownCompetitors = (getField(2) || "")
+        .split(/[,;]/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 3);
       const address = (session.customer_details && session.customer_details.address) || {};
       const location = [address.city, address.state, address.country]
         .filter(Boolean)
         .join(", ");
 
-      console.log(`New order from ${email} for ${businessName}`);
+      console.log(
+        `New order from ${email} for ${businessName} (${businessType || "type not given"}, ${location || "no location"})`
+      );
+
+      const discovered = await discoverCompetitors(businessType, location, businessName);
+      const discoveryResults = discovered.discoveryResults;
+      // Customer-named competitors first; discovery fills the rest (max 3).
+      const seen = new Set();
+      const names = [];
+      for (const n of [...knownCompetitors, ...discovered.names]) {
+        const key = n.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          names.push(n);
+        }
+      }
+      names.splice(3);
+      console.log(`Competitors for report: ${names.join(", ") || "(none)"}`);
 
       const searchResults = await Promise.all(
-        competitors.map((name) => searchCompetitor(name, location))
+        names.map((name) => searchCompetitor(name, location))
       );
-      const reportText = await writeReportWithGroq(businessName, competitors, searchResults);
+      const reportText = await writeReportWithGroq(
+        businessName,
+        businessType,
+        location,
+        names,
+        searchResults,
+        discoveryResults
+      );
       const pdfBuffer = await buildPdf(businessName, reportText);
 
       if (email) {
@@ -115,24 +152,119 @@ async function googleSearch(query) {
   }
 }
 
-async function writeReportWithGroq(businessName, competitors, searchResults) {
-  const [c1 = "", c2 = "", c3 = ""] = competitors;
-  const [r1 = "Not researched.", r2 = "Not researched.", r3 = "Not researched."] = searchResults;
+async function groqChat(prompt) {
+  const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "openai/gpt-oss-20b",
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  const data = await resp.json();
+  if (!data.choices || !data.choices[0]) {
+    console.error("Unexpected Groq response:", JSON.stringify(data));
+    throw new Error("Groq did not return a response.");
+  }
+  return data.choices[0].message.content;
+}
 
-  const prompt = `You are writing a competitor research report for a paying customer. The first half profiles each competitor. The second half is analysis — that analysis is what the customer is paying for, so make it sharp, specific, and impossible to mistake for a Google search summary.
+async function discoverCompetitors(businessType, location, businessName) {
+  // Find who this business actually competes with — including competitors
+  // the customer doesn't know exist — from live search results.
+  const type = businessType || businessName;
+  const queries = location
+    ? [
+        `best ${type} in ${location}`,
+        `${type} near ${location}`,
+        `top rated ${type} ${location}`,
+      ]
+    : [`best ${type}`, `${type} reviews`, `top ${type} companies`];
+  const results = await Promise.all(queries.map((q) => googleSearch(q)));
+  const discoveryResults = results.join("\n");
 
-Business being researched for: ${businessName}
+  const prompt = `A customer is starting a ${type}${location ? ` in ${location}` : ""}. From the web search results below, identify up to 3 real businesses they will compete with — the businesses a customer finds when looking for a ${type}${location ? ` in ${location}` : ""}.
 
-Web search results for Competitor 1 (${c1 || "not provided"}):
-${r1}
+Search results:
+${discoveryResults}
 
-Web search results for Competitor 2 (${c2 || "not provided"}):
-${r2}
+Reply with ONLY a JSON array of up to 3 business names, like ["Name One", "Name Two", "Name Three"]. Rules:
+- Only name businesses that actually appear in the search results.
+- Do not include "${businessName}".
+- If the results name fewer than 3, return only what you found. No other text.`;
 
-Web search results for Competitor 3 (${c3 || "not provided"}):
-${r3}
+  try {
+    const text = await groqChat(prompt);
+    const match = text.match(/\[[\s\S]*?\]/);
+    if (match) {
+      const names = JSON.parse(match[0])
+        .filter((n) => typeof n === "string" && n.trim().length > 0)
+        .map((n) => n.trim())
+        .slice(0, 3);
+      if (names.length > 0) {
+        console.log(`Discovered competitors: ${names.join(", ")}`);
+        return { names, discoveryResults };
+      }
+    }
+  } catch (err) {
+    console.error("Competitor discovery failed:", err.message);
+  }
+  console.log(
+    "Competitor discovery found no names; report will identify competitors from the market results."
+  );
+  return { names: [], discoveryResults };
+}
 
-For EACH named competitor above (skip any competitor with no name — never invent a company), output:
+async function writeReportWithGroq(
+  businessName,
+  businessType,
+  location,
+  competitors,
+  searchResults,
+  discoveryResults
+) {
+  const competitorBlocks =
+    competitors.length > 0
+      ? competitors
+          .map(
+            (name, i) =>
+              `Competitor ${i + 1}: ${name}\nWeb search results:\n${searchResults[i] || "Not researched."}`
+          )
+          .join("\n\n")
+      : "No competitor names were extracted from search. Identify the most relevant competitors from the market discovery results and your own knowledge of this market, and profile them.";
+
+  const prompt = `You are writing a competitor research report for a paying customer. The customer did NOT name their competitors — discovering who they are up against, including competitors they don't know exist, is the core of what they paid for. The report must do three things: (1) show them what their business could be worth, (2) profile the competitors found for them, and (3) show them exactly how to beat those competitors. Make it sharp, specific, and impossible to mistake for a Google search summary.
+
+Customer's business: ${businessName}
+What it does: ${businessType || "(not stated — infer it from the business name and market context)"}
+Market: ${location || "online / not specified"}
+
+Market discovery search results (what customers find when they look for this kind of business in this market):
+${discoveryResults}
+
+Competitor research:
+${competitorBlocks}
+
+Write the report in this exact structure:
+
+## What your business could be worth
+
+Estimate what ${businessName} could earn, grounded in the competitor pricing and market signals in the research above.
+
+**Year 1**
+[A realistic first-year revenue RANGE for a new entrant. Show the math in plain language: typical price per customer, believable customers per week, weeks open. State every assumption you use.]
+
+**Year 2 and beyond**
+[How the range grows once reviews, repeat customers, and word of mouth build. Show the changed assumptions: more customers per week, repeat/referral share, any price increases.]
+
+Rules for this section: always give ranges, never one exact figure; label these as estimates built on the stated assumptions; never promise or guarantee income.
+
+## Your competitors
+
+For EACH competitor in the research above, output:
 
 ## [Competitor name]
 
@@ -147,8 +279,6 @@ For EACH named competitor above (skip any competitor with no name — never inve
 
 **Traffic and distribution**
 [How they reach customers — cover BOTH local presence (physical stores, service area) AND online presence (website, app, delivery, social)]
-
-After all competitors, output the analysis:
 
 ## Head-to-head comparison
 
@@ -170,36 +300,37 @@ For each dimension below, give one short, direct line per competitor in this exa
 
 [The gaps NONE of the competitors are covering — unmet customer needs, ignored audiences, weak local or online presence. Explain why each gap is an opening for ${businessName}.]
 
+## How you beat them
+
+[The specific moves that would make ${businessName} better than the competition: an offer none of them have, an audience they ignore, an experience they do badly, a channel they neglect. For each move: what it is, which competitor weakness it exploits, and why customers would switch. This is the section the customer reads twice.]
+
 ## Your 30-day action plan
 
-[A numbered list of concrete moves ${businessName} can execute in the next 30 days — one action per line, each tied to a gap above. Quick wins first, bigger plays after. Each item: the action, then one line on why it works.]
+[A numbered list of concrete moves ${businessName} can execute in the next 30 days — one action per line, each tied to a gap or a "how you beat them" move above. Quick wins first, bigger plays after. Each item: the action, then one line on why it works.]
 
 Rules:
 - Treat the web search results as your primary source — they are the most current information.
-- Where the search results are thin, missing, or say "No search results found", fill the gap from your own knowledge of the company. Write a full, useful section anyway.
+- Where the search results are thin, missing, or say "No search results found", fill the gap from your own knowledge. Write a full, useful section anyway.
 - Cover each competitor locally AND online: a neighborhood shop can still have a strong web presence, and a national brand can have a weak local footprint. Call out both.
 - NEVER write "Not found in available sources", "recommend manual follow-up", "Not researched", or any placeholder text. Every section must contain real content.
 - Be specific: names of products, approximate price points, and concrete observations beat generic statements.
-- Every recommendation must trace back to a gap named in this report — no generic marketing advice.`;
+- Every recommendation must trace back to a competitor weakness or a gap named in this report — no generic marketing advice.`;
 
-  const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "openai/gpt-oss-20b",
-      messages: [{ role: "user", content: prompt }],
-    }),
+  return groqChat(prompt);
+}
+
+function printRichText(doc, text) {
+  // Groq writes **bold** spans. Print the bold segments with the bold
+  // font instead of letting the asterisks show in the PDF.
+  const segments = text
+    .split("**")
+    .map((part, i) => ({ part, bold: i % 2 === 1 }))
+    .filter((seg) => seg.part.length > 0);
+  segments.forEach((seg, i) => {
+    doc.font(seg.bold ? "Helvetica-Bold" : "Helvetica");
+    doc.text(seg.part, { continued: i < segments.length - 1 });
   });
-
-  const data = await resp.json();
-  if (!data.choices || !data.choices[0]) {
-    console.error("Unexpected Groq response:", JSON.stringify(data));
-    throw new Error("Groq did not return a report.");
-  }
-  return data.choices[0].message.content;
+  doc.font("Helvetica");
 }
 
 function buildPdf(businessName, reportText) {
@@ -226,7 +357,8 @@ function buildPdf(businessName, reportText) {
       } else if (trimmed.startsWith("**") && trimmed.endsWith("**")) {
         doc.fontSize(11.5).fillColor("#0F6E56").text(trimmed.replace(/\*\*/g, ""));
       } else if (trimmed.length > 0) {
-        doc.fontSize(10.5).fillColor("#222222").text(trimmed);
+        doc.fontSize(10.5).fillColor("#222222");
+        printRichText(doc, trimmed);
       } else {
         doc.moveDown(0.4);
       }
