@@ -161,6 +161,7 @@ async function groqChat(prompt) {
     },
     body: JSON.stringify({
       model: "openai/gpt-oss-20b",
+      max_tokens: 8192,
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -236,9 +237,7 @@ async function writeReportWithGroq(
           .join("\n\n")
       : "No competitor names were extracted from search. Identify the most relevant competitors from the market discovery results and your own knowledge of this market, and profile them.";
 
-  const prompt = `You are writing a competitor research report for a paying customer. The customer did NOT name their competitors — discovering who they are up against, including competitors they don't know exist, is the core of what they paid for. The report must do three things: (1) show them what their business could be worth, (2) profile the competitors found for them, and (3) show them exactly how to beat those competitors. Make it sharp, specific, and impossible to mistake for a Google search summary.
-
-Customer's business: ${businessName}
+  const sharedContext = `Customer's business: ${businessName}
 What it does: ${businessType || "(not stated — infer it from the business name and market context)"}
 Market: ${location || "online / not specified"}
 
@@ -246,9 +245,23 @@ Market discovery search results (what customers find when they look for this kin
 ${discoveryResults}
 
 Competitor research:
-${competitorBlocks}
+${competitorBlocks}`;
 
-Write the report in this exact structure:
+  const formatRules = `Formatting and quality rules:
+- Plain characters only: write x for multiplication and - for ranges. No italics, no special symbols.
+- Write money with commas, like $52,000.
+- Treat the web search results as your primary source — they are the most current information.
+- Where the search results are thin, missing, or say "No search results found", fill the gap from your own knowledge. Write a full, useful section anyway.
+- Cover each competitor locally AND online: a neighborhood shop can still have a strong web presence, and a national brand can have a weak local footprint. Call out both.
+- NEVER write "Not found in available sources", "recommend manual follow-up", "Not researched", or any placeholder text. Every section must contain real content.
+- Be specific: names of products, approximate price points, and concrete observations beat generic statements.`;
+
+  // Part 1: what the business could be worth + competitor profiles.
+  const partOnePrompt = `You are writing part 1 of a competitor research report for a paying customer. The customer did NOT name their competitors — discovering who they are up against, including competitors they don't know exist, is the core of what they paid for. Part 1 shows them what their business could be worth, then profiles each competitor found for them.
+
+${sharedContext}
+
+Write ONLY these sections, in this order:
 
 ## What your business could be worth
 
@@ -280,6 +293,16 @@ For EACH competitor in the research above, output:
 **Traffic and distribution**
 [How they reach customers — cover BOTH local presence (physical stores, service area) AND online presence (website, app, delivery, social)]
 
+${formatRules}`;
+
+  // Part 2: the analysis — comparison, gaps, how to beat them, action plan.
+  // Split into a second call so a long report never gets cut off.
+  const partTwoPrompt = `You are writing part 2 of a competitor research report for ${businessName}. Part 1 (already written) estimated what the business could be worth and profiled each competitor. Part 2 is the analysis: how the competitors stack up, where the openings are, how to beat them, and what to do in the next 30 days. Make it sharp, specific, and impossible to mistake for a Google search summary.
+
+${sharedContext}
+
+Write ONLY these sections, in this order:
+
 ## Head-to-head comparison
 
 For each dimension below, give one short, direct line per competitor in this exact format:
@@ -309,22 +332,27 @@ For each dimension below, give one short, direct line per competitor in this exa
 [A numbered list of concrete moves ${businessName} can execute in the next 30 days — one action per line, each tied to a gap or a "how you beat them" move above. Quick wins first, bigger plays after. Each item: the action, then one line on why it works.]
 
 Rules:
-- Treat the web search results as your primary source — they are the most current information.
-- Where the search results are thin, missing, or say "No search results found", fill the gap from your own knowledge. Write a full, useful section anyway.
-- Cover each competitor locally AND online: a neighborhood shop can still have a strong web presence, and a national brand can have a weak local footprint. Call out both.
-- NEVER write "Not found in available sources", "recommend manual follow-up", "Not researched", or any placeholder text. Every section must contain real content.
-- Be specific: names of products, approximate price points, and concrete observations beat generic statements.
-- Every recommendation must trace back to a competitor weakness or a gap named in this report — no generic marketing advice.`;
+- Every recommendation must trace back to a competitor weakness or a gap named in this report — no generic marketing advice.
+${formatRules}`;
 
-  return groqChat(prompt);
+  const partOne = await groqChat(partOnePrompt);
+  const partTwo = await groqChat(partTwoPrompt);
+  return `${partOne}\n\n${partTwo}`;
 }
 
 function printRichText(doc, text) {
   // Groq writes **bold** spans. Print the bold segments with the bold
-  // font instead of letting the asterisks show in the PDF.
+  // font instead of letting the asterisks show in the PDF. Also swap
+  // special symbols for plain characters the PDF font renders cleanly.
   const segments = text
     .split("**")
-    .map((part, i) => ({ part, bold: i % 2 === 1 }))
+    .map((part, i) => ({
+      part: part
+        .replace(/×/g, "x")
+        .replace(/[–—]/g, "-")
+        .replace(/\*/g, ""),
+      bold: i % 2 === 1,
+    }))
     .filter((seg) => seg.part.length > 0);
   segments.forEach((seg, i) => {
     doc.font(seg.bold ? "Helvetica-Bold" : "Helvetica");
