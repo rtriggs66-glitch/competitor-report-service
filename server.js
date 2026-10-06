@@ -3,7 +3,11 @@ const Stripe = require("stripe");
 const PDFDocument = require("pdfkit");
 
 const app = express();
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+// Trim pasted secrets: a stray space or newline in an env value would
+// otherwise break webhook signature checks (and looks identical on screen).
+const STRIPE_SECRET_KEY = (process.env.STRIPE_SECRET_KEY || "").trim();
+const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+const stripe = new Stripe(STRIPE_SECRET_KEY);
 
 // Startup check: log any missing env vars so failures are obvious in Render logs
 const requiredEnv = [
@@ -21,8 +25,8 @@ if (missingEnv.length > 0) {
 
 // Startup diagnostics: lengths and prefixes only, never secret values.
 {
-  const sk = process.env.STRIPE_SECRET_KEY || "";
-  const wh = process.env.STRIPE_WEBHOOK_SECRET || "";
+  const sk = STRIPE_SECRET_KEY;
+  const wh = STRIPE_WEBHOOK_SECRET;
   console.log(
     `Stripe key check: len=${sk.length} live=${sk.startsWith("sk_live_")} test=${sk.startsWith("sk_test_")}`
   );
@@ -49,7 +53,7 @@ app.post(
       event = stripe.webhooks.constructEvent(
         req.body,
         req.headers["stripe-signature"],
-        process.env.STRIPE_WEBHOOK_SECRET
+        STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
       console.error("Webhook signature check failed:", err.message);
