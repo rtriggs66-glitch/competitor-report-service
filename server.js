@@ -18,6 +18,18 @@ const missingEnv = requiredEnv.filter((k) => !process.env[k]);
 if (missingEnv.length > 0) {
   console.error("Missing env vars:", missingEnv.join(", "));
 }
+
+// Startup diagnostics: lengths and prefixes only, never secret values.
+{
+  const sk = process.env.STRIPE_SECRET_KEY || "";
+  const wh = process.env.STRIPE_WEBHOOK_SECRET || "";
+  console.log(
+    `Stripe key check: len=${sk.length} live=${sk.startsWith("sk_live_")} test=${sk.startsWith("sk_test_")}`
+  );
+  console.log(
+    `Webhook secret check: len=${wh.length} trimmed=${wh.trim().length} whsec=${wh.startsWith("whsec_")}`
+  );
+}
 if (!process.env.BREVO_SENDER_EMAIL && !process.env.GMAIL_USER) {
   console.error(
     "Missing email sender: set BREVO_SENDER_EMAIL or GMAIL_USER to your Brevo-verified sender address."
