@@ -343,9 +343,20 @@ For each dimension below, give one short, direct line per competitor in this exa
 
 [The specific moves that would make ${businessName} better than the competition: an offer none of them have, an audience they ignore, an experience they do badly, a channel they neglect. For each move: what it is, which competitor weakness it exploits, and why customers would switch. This is the section the customer reads twice.]
 
+## Platform money map
+
+For EACH named competitor, write one block:
+
+**[Competitor name] — platforms and money rails**
+- Present on: [which of TikTok, Facebook, Instagram, YouTube, Pinterest, Threads they visibly use — from the search results above]
+- Using now: [the monetization rails they visibly exploit: platform ad payouts, affiliate links, own product sales, brand deals, subscriptions, fan tips]
+- Leaving on the table: [rails they qualify for by visible audience size but aren't using, with the one-line play they'd run]
+
+Use these current 2026 thresholds when judging qualification: TikTok Creator Rewards needs 10K followers + 100K views in 30 days and only pays on videos 1+ minute (RPM ~$0.40–$1.50 per 1K); TikTok Shop affiliate opens at 1K followers (5–25% commission); Facebook Content Monetization needs a Page with 10K followers and 600K watch minutes in 60 days (RPM ~$1–$10 per 1K); Facebook Stars opens at 500 followers ($0.01/star); Instagram Subscriptions needs 10K followers; YouTube Partner Program needs 1K subs + 4K watch hours or 10M Shorts views; Pinterest and Threads pay nothing directly — money there comes from affiliate links, own products, and funnels. If a competitor's audience size is unknown, say so and judge from visible activity only.
+
 ## Your 30-day action plan
 
-[A numbered list of concrete moves ${businessName} can execute in the next 30 days — one action per line, each tied to a gap or a "how you beat them" move above. Quick wins first, bigger plays after. Each item: the action, then one line on why it works.]
+[A numbered list of concrete moves ${businessName} can execute in the next 30 days — one action per line, each tied to a gap or a "how you beat them" move above. Quick wins first, bigger plays after. Each item: the action, then one line on why it works. Include at least one money-rail move per competitor gap named above (e.g., "Competitor X has TikTok audience but no Shop affiliate play — you run product-pinned videos").]
 
 Rules:
 - Every recommendation must trace back to a competitor weakness or a gap named in this report — no generic marketing advice.
