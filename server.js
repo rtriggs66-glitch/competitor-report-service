@@ -1,6 +1,7 @@
 const express = require("express");
 const Stripe = require("stripe");
 const PDFDocument = require("pdfkit");
+const crypto = require("crypto");
 
 const app = express();
 // Trim pasted secrets: a stray space or newline in an env value would
@@ -8,6 +9,16 @@ const app = express();
 const STRIPE_SECRET_KEY = (process.env.STRIPE_SECRET_KEY || "").trim();
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
 const stripe = new Stripe(STRIPE_SECRET_KEY);
+
+// Lovable handoff: buyer follow-up questions live on the Lovable site,
+// not on this server. All three values come from Render env vars.
+// Reports still deliver if they are missing — Q&A access simply is not
+// created. Never put these values in code, chat, or the repo.
+const LOVABLE_CALLBACK_URL = (process.env.LOVABLE_CALLBACK_URL || "").trim();
+const LOVABLE_CALLBACK_SECRET = (process.env.LOVABLE_CALLBACK_SECRET || "").trim();
+const LOVABLE_SITE_URL = (process.env.LOVABLE_SITE_URL || "").trim().replace(/\/$/, "");
+const QUESTIONS_TOTAL = 5;
+const CLAIM_TTL_MS = 30 * 24 * 60 * 60 * 1000; // claim link good for 30 days
 
 // Startup check: log any missing env vars so failures are obvious in Render logs
 const requiredEnv = [
@@ -34,9 +45,24 @@ if (missingEnv.length > 0) {
     `Webhook secret check: len=${wh.length} trimmed=${wh.trim().length} whsec=${wh.startsWith("whsec_")}`
   );
 }
+// In-memory only. Durable truth lives in Lovable's DB (unique
+// checkout_session_id, questions_used) and in Stripe (event + session).
+// A Render restart clears these maps. That must never grant access or
+// reset an allowance — Lovable enforces the count, and a duplicate
+// webhook after a restart re-sends the SAME payload (same claim token,
+// same idempotency key) instead of creating a new one.
+const inflightSessions = new Set();
+const deliveredSessions = new Map();
+const seenEvents = new Set();
+
 if (!process.env.BREVO_SENDER_EMAIL && !process.env.GMAIL_USER) {
   console.error(
     "Missing email sender: set BREVO_SENDER_EMAIL or GMAIL_USER to your Brevo-verified sender address."
+  );
+}
+if (!LOVABLE_CALLBACK_URL || !LOVABLE_CALLBACK_SECRET || !LOVABLE_SITE_URL) {
+  console.error(
+    "Lovable Q&A not configured: set LOVABLE_CALLBACK_URL, LOVABLE_CALLBACK_SECRET and LOVABLE_SITE_URL. Reports still deliver without them."
   );
 }
 
@@ -60,12 +86,67 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    // Ack fast so Stripe does not retry. All granting happens below, and
+    // only after the report email succeeds. A failure after this ack does
+    // NOT trigger a Stripe retry — recovery is resending the event from
+    // the Stripe dashboard, which is safe: duplicates never re-grant.
     res.status(200).send("Received");
 
-    if (event.type !== "checkout.session.completed") return;
+    if (event.type === "checkout.session.async_payment_failed") {
+      console.log(
+        `Async payment failed for session ${event.data.object.id}; no access granted.`
+      );
+      return;
+    }
+    if (
+      event.type !== "checkout.session.completed" &&
+      event.type !== "checkout.session.async_payment_succeeded"
+    ) {
+      return;
+    }
+
+    const session = event.data.object;
+
+    // Grant ONLY a successfully paid, one-time $19 purchase of this report.
+    // The event object is authenticated by the Stripe signature above, so
+    // these fields are trustworthy. Never trust values from a browser.
+    if (session.payment_status !== "paid") {
+      console.log(
+        `Session ${session.id} payment_status=${session.payment_status}; no access granted.`
+      );
+      return;
+    }
+    if (session.mode !== "payment") {
+      console.log(
+        `Session ${session.id} mode=${session.mode}; not a one-time purchase, no access granted.`
+      );
+      return;
+    }
+    if (session.amount_total !== 1900 || (session.currency || "").toLowerCase() !== "usd") {
+      console.log(
+        `Session ${session.id} amount=${session.amount_total} ${session.currency}; not the $19 report, no access granted.`
+      );
+      return;
+    }
+
+    // Idempotency: a duplicate Stripe delivery (same event, or a second
+    // event for the same session) must never regenerate the report,
+    // re-send the callback, or reset the 5-question allowance.
+    if (seenEvents.has(event.id) || deliveredSessions.has(session.id)) {
+      console.log(
+        `Duplicate webhook for session ${session.id} (event ${event.id}); skipped, allowance untouched.`
+      );
+      return;
+    }
+    if (inflightSessions.has(session.id)) {
+      console.log(
+        `Concurrent webhook for session ${session.id}; first delivery is handling it.`
+      );
+      return;
+    }
+    inflightSessions.add(session.id);
 
     try {
-      const session = event.data.object;
       const email = session.customer_details && session.customer_details.email;
       const fields = session.custom_fields || [];
       const getField = (i) =>
@@ -124,17 +205,197 @@ app.post(
       );
       const pdfBuffer = await buildPdf(businessName, reportText);
 
-      if (email) {
-        await sendEmail(email, businessName, pdfBuffer);
-        console.log(`Report emailed to ${email}`);
-      } else {
+      if (!email) {
         console.error("No customer email found on session; could not send.");
+        return;
+      }
+
+      // Claim token: proves ownership of the checkout email. The raw token
+      // goes ONLY to the buyer's inbox (in the report email) and to
+      // Lovable's server (in the signed callback). Lovable stores only
+      // its SHA-256 hash. A browser-supplied email or session ID alone
+      // can never claim access.
+      const claimToken = crypto.randomBytes(32).toString("base64url");
+      const claimTokenHash = sha256Hex(claimToken);
+      const claimExpiresAt = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
+      const claimLink = LOVABLE_SITE_URL
+        ? `${LOVABLE_SITE_URL}/claim?token=${claimToken}`
+        : null;
+
+      await sendEmail(email, businessName, pdfBuffer, claimLink);
+      console.log(`Report emailed to ${email}`);
+
+      const payload = {
+        version: "ryc-lovable-1",
+        event: "report.delivered",
+        checkout_session_id: session.id,
+        stripe_event_id: event.id,
+        buyer_email: email,
+        business_name: businessName,
+        business_type: businessType,
+        location,
+        report_text: reportText,
+        claim_token: claimToken,
+        claim_expires_at: claimExpiresAt,
+        questions_total: QUESTIONS_TOTAL,
+        questions_used: 0,
+        amount_total: session.amount_total,
+        currency: (session.currency || "usd").toLowerCase(),
+        mode: session.mode,
+        paid_at: session.created
+          ? new Date(session.created * 1000).toISOString()
+          : null,
+        delivered_at: new Date().toISOString(),
+      };
+
+      // Record delivery BEFORE the callback, so a retry or re-drive
+      // re-sends this exact payload (same token, same idempotency key) —
+      // never a new token, never a reset count.
+      deliveredSessions.set(session.id, { claimTokenHash, claimExpiresAt, payload });
+      seenEvents.add(event.id);
+      if (seenEvents.size > 1000) {
+        seenEvents.delete(seenEvents.values().next().value);
+      }
+
+      const cb = await sendLovableCallback(payload);
+      if (cb.sent) {
+        console.log(`Lovable callback sent for session ${session.id}`);
+      } else {
+        console.error(
+          `Lovable callback NOT sent for session ${session.id} (${cb.reason}). Report was emailed; re-drive with POST /lovable/redrive once Lovable is reachable.`
+        );
       }
     } catch (err) {
       console.error("Error processing order:", err);
+    } finally {
+      inflightSessions.delete(session.id);
     }
   }
 );
+
+// Health check (no secrets): confirms the service is up and whether the
+// Lovable handoff is configured.
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    lovableConfigured: Boolean(
+      LOVABLE_CALLBACK_URL && LOVABLE_CALLBACK_SECRET && LOVABLE_SITE_URL
+    ),
+  });
+});
+
+// Re-drive a failed Lovable callback. Server-to-server only: the caller
+// must sign the raw body with LOVABLE_CALLBACK_SECRET (same HMAC scheme
+// as the callback). Re-sends the STORED payload for that session — same
+// claim token, same idempotency key — so it can never reset the allowance.
+// If Render restarted since delivery, the payload is gone (404): resend
+// the Stripe event from the Stripe dashboard instead.
+app.post(
+  "/lovable/redrive",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!LOVABLE_CALLBACK_SECRET) {
+      return res.status(503).json({ error: "lovable-not-configured" });
+    }
+    let body;
+    try {
+      body = JSON.parse(req.body.toString("utf8"));
+    } catch (err) {
+      return res.status(400).json({ error: "bad-json" });
+    }
+    const ts = req.headers["x-ryc-timestamp"];
+    const sig = req.headers["x-ryc-signature"];
+    if (!verifyLovableSignature(ts, sig, req.body)) {
+      return res.status(401).json({ error: "bad-signature" });
+    }
+    const sessionId = body && body.checkout_session_id;
+    const record = sessionId && deliveredSessions.get(sessionId);
+    if (!record) {
+      return res.status(404).json({
+        error: "unknown-session",
+        hint: "Render no longer holds this delivery (restart or never delivered). Resend the Stripe event from the Stripe dashboard.",
+      });
+    }
+    const cb = await sendLovableCallback(record.payload);
+    if (!cb.sent) {
+      return res.status(502).json({ error: "callback-failed", reason: cb.reason });
+    }
+    return res.json({ resent: true, checkout_session_id: sessionId });
+  }
+);
+
+function sha256Hex(value) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function signLovableBody(secret, timestamp, rawBody) {
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`${timestamp}.${rawBody}`)
+    .digest("hex");
+}
+
+function timingSafeEqualStr(a, b) {
+  const ba = Buffer.from(a || "");
+  const bb = Buffer.from(b || "");
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+// Verifies an incoming server-to-server request: timestamp within 5 minutes
+// (replay protection) + HMAC over "<timestamp>.<raw body>".
+function verifyLovableSignature(timestamp, signature, rawBody) {
+  if (!timestamp || !signature || !rawBody) return false;
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - Number(timestamp)) > 300) return false;
+  const expected = signLovableBody(
+    LOVABLE_CALLBACK_SECRET,
+    String(timestamp),
+    rawBody.toString("utf8")
+  );
+  return timingSafeEqualStr(signature, expected);
+}
+
+// Sends the delivered report to Lovable. 3 attempts (now, +2s, +10s).
+// A failure here never fails the order — the report is already emailed.
+// Use POST /lovable/redrive to retry.
+async function sendLovableCallback(payload) {
+  if (!LOVABLE_CALLBACK_URL || !LOVABLE_CALLBACK_SECRET) {
+    return { sent: false, reason: "not-configured" };
+  }
+  const rawBody = JSON.stringify(payload);
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const signature = signLovableBody(LOVABLE_CALLBACK_SECRET, timestamp, rawBody);
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, attempt === 1 ? 2000 : 10000));
+    }
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      const resp = await fetch(LOVABLE_CALLBACK_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-RYC-Timestamp": timestamp,
+          "X-RYC-Signature": signature,
+          "X-RYC-Idempotency-Key": payload.checkout_session_id,
+        },
+        body: rawBody,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (resp.ok) return { sent: true };
+      lastErr = new Error(`Lovable callback HTTP ${resp.status}`);
+      console.error("Lovable callback failed:", resp.status, await resp.text().catch(() => ""));
+    } catch (err) {
+      lastErr = err;
+      console.error("Lovable callback error:", err.message);
+    }
+  }
+  return { sent: false, reason: lastErr ? lastErr.message : "unknown" };
+}
 
 app.use(express.json());
 
@@ -424,7 +685,7 @@ function buildPdf(businessName, reportText) {
   });
 }
 
-async function sendEmail(toEmail, businessName, pdfBuffer) {
+async function sendEmail(toEmail, businessName, pdfBuffer, claimLink) {
   const senderEmail = process.env.BREVO_SENDER_EMAIL || process.env.GMAIL_USER;
   if (!senderEmail) {
     throw new Error(
@@ -446,8 +707,9 @@ async function sendEmail(toEmail, businessName, pdfBuffer) {
       },
       to: [{ email: toEmail }],
       subject: `Your competitor report for ${businessName}`,
-      textContent:
-        "Thanks for your order! Your competitor report is attached as a PDF.",
+      textContent: claimLink
+        ? `Thanks for your order! Your competitor report is attached as a PDF.\n\nQuestions about your competitors? You get 5 follow-up questions about this report, answered by AI from your report only:\n${claimLink}\n\nThat link is private to your order — it proves you bought the report. It stops working after 30 days.`
+        : "Thanks for your order! Your competitor report is attached as a PDF.",
       attachment: [
         {
           content: pdfBuffer.toString("base64"),
