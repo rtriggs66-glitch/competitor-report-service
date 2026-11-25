@@ -149,13 +149,22 @@ app.post(
     try {
       const email = session.customer_details && session.customer_details.email;
       const fields = session.custom_fields || [];
-      const getField = (i) =>
-        fields[i] && fields[i].text ? fields[i].text.value : "";
+      // Custom fields can be text, numeric, or dropdown depending on how
+      // the payment link defines them. Read whichever shape is present.
+      const getField = (i) => {
+        const f = fields[i];
+        if (!f) return "";
+        if (f.text) return f.text.value || "";
+        if (f.numeric) return f.numeric.value || "";
+        if (f.dropdown) return f.dropdown.value || "";
+        return "";
+      };
       // Intake: the customer describes THEIR business. Naming competitors
       // is optional (field 3) — discovery finds the rest, including the
       // ones they don't know exist.
       // Payment link field order: 1 business name, 2 what it does,
-      // 3 competitors you already know (optional).
+      // 3 competitors you already know (optional),
+      // 4 how much they have to invest (optional).
       const businessName =
         getField(0) ||
         (session.customer_details && session.customer_details.business_name) ||
@@ -168,13 +177,16 @@ app.post(
         .map((s) => s.trim())
         .filter(Boolean)
         .slice(0, 3);
+      // Optional: how much money they have to invest in the idea (field 4).
+      // Parsed to a plain number; anything unparseable counts as "not stated".
+      const investmentAmount = parseInvestmentAmount(getField(3));
       const address = (session.customer_details && session.customer_details.address) || {};
       const location = [address.city, address.state, address.country]
         .filter(Boolean)
         .join(", ");
 
       console.log(
-        `New order from ${email} for ${businessName} (${businessType || "type not given"}, ${location || "no location"})`
+        `New order from ${email} for ${businessName} (${businessType || "type not given"}, ${location || "no location"}${investmentAmount ? `, investing $${investmentAmount.toLocaleString("en-US")}` : ""})`
       );
 
       const discovered = await discoverCompetitors(businessType, location, businessName);
@@ -201,7 +213,8 @@ app.post(
         location,
         names,
         searchResults,
-        discoveryResults
+        discoveryResults,
+        investmentAmount
       );
       const pdfBuffer = await buildPdf(businessName, reportText);
 
@@ -234,6 +247,7 @@ app.post(
         business_name: businessName,
         business_type: businessType,
         location,
+        investment_amount_usd: investmentAmount,
         report_text: reportText,
         claim_token: claimToken,
         claim_expires_at: claimExpiresAt,
@@ -429,6 +443,18 @@ async function googleSearch(query) {
   }
 }
 
+// Turns the investment field into a plain number of dollars, or null.
+// Accepts "$5,000", "5000", "5,000.00". Anything else counts as not stated.
+function parseInvestmentAmount(raw) {
+  if (!raw) return null;
+  if (String(raw).includes('-')) return null;
+  const cleaned = String(raw).replace(/[^0-9.]/g, "");
+  if (!cleaned) return null;
+  const amount = parseFloat(cleaned);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 100000000) return null;
+  return Math.round(amount);
+}
+
 async function groqChat(prompt) {
   const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
@@ -437,7 +463,7 @@ async function groqChat(prompt) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/gpt-oss-20b",
+      model: "openai/gpt-oss-120b",
       max_tokens: 8192,
       messages: [{ role: "user", content: prompt }],
     }),
@@ -502,7 +528,8 @@ async function writeReportWithGroq(
   location,
   competitors,
   searchResults,
-  discoveryResults
+  discoveryResults,
+  investmentAmount
 ) {
   const competitorBlocks =
     competitors.length > 0
@@ -517,6 +544,7 @@ async function writeReportWithGroq(
   const sharedContext = `Customer's business: ${businessName}
 What it does: ${businessType || "(not stated — infer it from the business name and market context)"}
 Market: ${location || "online / not specified"}
+Money they have to invest: ${investmentAmount ? `$${investmentAmount.toLocaleString("en-US")}` : "(not stated)"}
 
 Market discovery search results (what customers find when they look for this kind of business in this market):
 ${discoveryResults}
@@ -551,6 +579,12 @@ Estimate what ${businessName} could earn, grounded in the competitor pricing and
 [How the range grows once reviews, repeat customers, and word of mouth build. Show the changed assumptions: more customers per week, repeat/referral share, any price increases.]
 
 Rules for this section: always give ranges, never one exact figure; label these as estimates built on the stated assumptions; never promise or guarantee income.
+
+## What your money could return
+
+[Only if the customer stated an investment amount above: use that exact amount. Compare it to the Year 1 range you just estimated. Show: (a) what the Year 1 low end and high end each mean against that investment — how much of it comes back in year 1 at each end; (b) simple ROI at each end as a percentage: (Year 1 revenue - investment) / investment; (c) how many months to earn the investment back at the Year 1 pace, at each end. Show the math in plain language, one line per number. If the Year 1 low end is below the investment, say so plainly: at the low end they would not earn it back in year 1. If no investment amount was stated above, write exactly one line: "You didn't share an investment amount, so there's no ROI math in this report — weigh the Year 1 range above against what you plan to put in."]
+
+Rules for this section: always show the math; always give both ends of the range; label everything as estimates built on the stated assumptions; never promise or guarantee income; this is not financial advice.
 
 ## Your competitors
 
