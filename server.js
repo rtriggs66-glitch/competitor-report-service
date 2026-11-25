@@ -107,9 +107,11 @@ app.post(
 
     const session = event.data.object;
 
-    // Grant ONLY a successfully paid, one-time $19 purchase of this report.
-    // The event object is authenticated by the Stripe signature above, so
-    // these fields are trustworthy. Never trust values from a browser.
+    // Grant ONLY a successfully paid, one-time $19 purchase of this report —
+    // or a $0 order paid with a 100% discount code (the COMPETITION free
+    // code Wayne hands to fellow competition entrants). The event object is
+    // authenticated by the Stripe signature above, so these fields are
+    // trustworthy. Never trust values from a browser.
     if (session.payment_status !== "paid") {
       console.log(
         `Session ${session.id} payment_status=${session.payment_status}; no access granted.`
@@ -122,9 +124,14 @@ app.post(
       );
       return;
     }
-    if (session.amount_total !== 1900 || (session.currency || "").toLowerCase() !== "usd") {
+    const discountApplied =
+      (session.total_details && (session.total_details.amount_discount || 0)) > 0 ||
+      (Array.isArray(session.discounts) && session.discounts.length > 0);
+    const isPaidReport =
+      session.amount_total === 1900 || (session.amount_total === 0 && discountApplied);
+    if (!isPaidReport || (session.currency || "").toLowerCase() !== "usd") {
       console.log(
-        `Session ${session.id} amount=${session.amount_total} ${session.currency}; not the $19 report, no access granted.`
+        `Session ${session.id} amount=${session.amount_total} ${session.currency}; not the $19 report (or a $0 code order), no access granted.`
       );
       return;
     }
