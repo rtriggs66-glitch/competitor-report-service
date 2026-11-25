@@ -159,27 +159,21 @@ app.post(
         if (f.dropdown) return f.dropdown.value || "";
         return "";
       };
-      // Intake: the customer describes THEIR business. Naming competitors
-      // is optional (field 3) — discovery finds the rest, including the
-      // ones they don't know exist.
-      // Payment link field order: 1 business name, 2 what it does,
-      // 3 competitors you already know (optional),
-      // 4 how much they have to invest (optional).
+      // Intake: the customer describes THEIR business.
+      // Payment link field order (changed 2026-11-24 — the old
+      // "competitors you already know" field was removed):
+      // 1 business name, 2 what it does,
+      // 3 how much they have to invest (optional).
+      // Discovery finds the competitors now — buyers no longer name any.
       const businessName =
         getField(0) ||
         (session.customer_details && session.customer_details.business_name) ||
         "the customer's business";
       const businessType = getField(1);
-      // Optional: competitors the customer already knows (field 3,
-      // comma-separated). Discovery still runs and fills remaining slots.
-      const knownCompetitors = (getField(2) || "")
-        .split(/[,;]/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .slice(0, 3);
-      // Optional: how much money they have to invest in the idea (field 4).
+      // Optional: how much money they have to invest in the idea (field 3).
       // Parsed to a plain number; anything unparseable counts as "not stated".
-      const investmentAmount = parseInvestmentAmount(getField(3));
+      // The field is TEXT type on the link, so "$5,000" and "5000" both work.
+      const investmentAmount = parseInvestmentAmount(getField(2));
       const address = (session.customer_details && session.customer_details.address) || {};
       const location = [address.city, address.state, address.country]
         .filter(Boolean)
@@ -191,10 +185,10 @@ app.post(
 
       const discovered = await discoverCompetitors(businessType, location, businessName);
       const discoveryResults = discovered.discoveryResults;
-      // Customer-named competitors first; discovery fills the rest (max 3).
+      // Discovery finds the competitors (max 3) — buyers name none.
       const seen = new Set();
       const names = [];
-      for (const n of [...knownCompetitors, ...discovered.names]) {
+      for (const n of discovered.names) {
         const key = n.toLowerCase();
         if (!seen.has(key)) {
           seen.add(key);
